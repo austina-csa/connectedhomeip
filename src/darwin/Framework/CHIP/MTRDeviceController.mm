@@ -26,13 +26,16 @@
 #import "MTRCommissionableBrowserResult_Internal.h"
 #import "MTRCommissioningParameters.h"
 #import "MTRConversion.h"
+#import "MTRDefines_Internal.h"
 #import "MTRDeviceControllerDelegateBridge.h"
 #import "MTRDeviceControllerFactory_Internal.h"
 #import "MTRDeviceControllerLocalTestStorage.h"
 #import "MTRDeviceControllerStartupParams.h"
 #import "MTRDeviceControllerStartupParams_Internal.h"
+#import "MTRDeviceControllerXPCParameters.h"
 #import "MTRDeviceController_Concrete.h"
 #import "MTRDeviceController_XPC.h"
+#import "MTRDeviceController_XPC_Internal.h"
 #import "MTRDevice_Concrete.h"
 #import "MTRDevice_Internal.h"
 #import "MTRError_Internal.h"
@@ -160,11 +163,6 @@ using namespace chip::Tracing::DarwinFramework;
     // specific queue, so can't race against each other.
     std::atomic<bool> _suspended;
 
-    // Counters to track assertion status and access controlled by the _assertionLock
-    NSUInteger _keepRunningAssertionCounter;
-    BOOL _shutdownPending;
-    os_unfair_lock _assertionLock;
-
     NSMutableArray<MTRDeviceControllerDelegateInfo *> * _delegates;
     id<MTRDeviceControllerDelegate> _strongDelegateForSetDelegateAPI;
 }
@@ -183,11 +181,6 @@ using namespace chip::Tracing::DarwinFramework;
     }
     _underlyingDeviceMapLock = OS_UNFAIR_LOCK_INIT;
 
-    // Setup assertion variables
-    _keepRunningAssertionCounter = 0;
-    _shutdownPending = NO;
-    _assertionLock = OS_UNFAIR_LOCK_INIT;
-
     _suspended = startSuspended;
 
     _nodeIDToDeviceMap = [NSMapTable strongToWeakObjectsMapTable];
@@ -199,20 +192,31 @@ using namespace chip::Tracing::DarwinFramework;
 
 - (nullable MTRDeviceController *)initWithParameters:(MTRDeviceControllerAbstractParameters *)parameters error:(NSError * __autoreleasing *)error
 {
+    // Dispatch to the right non-abstract implementation.
     if ([parameters isKindOfClass:MTRXPCDeviceControllerParameters.class]) {
         MTR_LOG("Starting up with XPC Device Controller Parameters: %@", parameters);
         return [[MTRDeviceController_XPC alloc] initWithParameters:parameters error:error];
-    } else if (![parameters isKindOfClass:MTRDeviceControllerParameters.class]) {
-        MTR_LOG_ERROR("Unsupported type of MTRDeviceControllerAbstractParameters: %@", parameters);
-        if (error) {
-            *error = [MTRError errorForCHIPErrorCode:CHIP_ERROR_INVALID_ARGUMENT];
-        }
-        return nil;
     }
-    auto * controllerParameters = static_cast<MTRDeviceControllerParameters *>(parameters);
 
-    // MTRDeviceControllerFactory will auto-start in per-controller-storage mode if necessary
-    return [MTRDeviceControllerFactory.sharedInstance initializeController:[MTRDeviceController_Concrete alloc] withParameters:controllerParameters error:error];
+    if ([parameters isKindOfClass:MTRDeviceControllerMachServiceXPCParameters.class]) {
+        // TODO: This will need to at least pass in the uniqueIdentifier, no?  initWithMachServiceName:options: seems to
+        // be declared but not actually implemented...
+        auto * xpcParameters = static_cast<MTRDeviceControllerMachServiceXPCParameters *>(parameters);
+
+        MTR_LOG("Starting up with Mach Service XPC Device Controller Parameters: %@", parameters);
+        return [[MTRDeviceController_XPC alloc] initWithMachServiceName:xpcParameters.machServiceName options:xpcParameters.connectionOptions];
+    }
+
+    if ([parameters isKindOfClass:MTRDeviceControllerParameters.class]) {
+        MTR_LOG("Starting up with Device Controller Parameters: %@", parameters);
+        return [[MTRDeviceController_Concrete alloc] initWithParameters:parameters error:error];
+    }
+
+    MTR_LOG_ERROR("Unsupported type of MTRDeviceControllerAbstractParameters: %@", parameters);
+    if (error) {
+        *error = [MTRError errorForCHIPErrorCode:CHIP_ERROR_INVALID_ARGUMENT];
+    }
+    return nil;
 }
 
 - (instancetype)initWithFactory:(MTRDeviceControllerFactory *)factory
@@ -230,11 +234,6 @@ using namespace chip::Tracing::DarwinFramework;
         // Make sure our storage is all set up to work as early as possible,
         // before we start doing anything else with the controller.
         _uniqueIdentifier = uniqueIdentifier;
-
-        // Setup assertion variables
-        _keepRunningAssertionCounter = 0;
-        _shutdownPending = NO;
-        _assertionLock = OS_UNFAIR_LOCK_INIT;
 
         _suspended = startSuspended;
 
@@ -478,75 +477,21 @@ using namespace chip::Tracing::DarwinFramework;
 
 - (BOOL)matchesPendingShutdownControllerWithOperationalCertificate:(nullable MTRCertificateDERBytes)operationalCertificate andRootCertificate:(nullable MTRCertificateDERBytes)rootCertificate
 {
-    if (!operationalCertificate || !rootCertificate) {
-        return FALSE;
-    }
-    NSNumber * nodeID = [MTRDeviceControllerParameters nodeIDFromNOC:operationalCertificate];
-    NSNumber * fabricID = [MTRDeviceControllerParameters fabricIDFromNOC:operationalCertificate];
-    NSData * publicKey = [MTRDeviceControllerParameters publicKeyFromCertificate:rootCertificate];
-
-    std::lock_guard lock(_assertionLock);
-
-    // If any of the local above are nil, the return will be false since MTREqualObjects handles them correctly
-    return _keepRunningAssertionCounter > 0 && _shutdownPending && MTREqualObjects(nodeID, self.nodeID) && MTREqualObjects(fabricID, self.fabricID) && MTREqualObjects(publicKey, self.rootPublicKey);
-}
-
-- (void)addRunAssertion
-{
-    std::lock_guard lock(_assertionLock);
-
-    // Only take an assertion if running
-    if ([self isRunning]) {
-        ++_keepRunningAssertionCounter;
-        MTR_LOG("%@ Adding keep running assertion, total %lu", self, static_cast<unsigned long>(_keepRunningAssertionCounter));
-    }
-}
-
-- (void)removeRunAssertion;
-{
-    std::lock_guard lock(_assertionLock);
-
-    if (_keepRunningAssertionCounter > 0) {
-        --_keepRunningAssertionCounter;
-        MTR_LOG("%@ Removing keep running assertion, total %lu", self, static_cast<unsigned long>(_keepRunningAssertionCounter));
-
-        if ([self isRunning] && _keepRunningAssertionCounter == 0 && _shutdownPending) {
-            MTR_LOG("%@ All assertions removed and shutdown is pending, shutting down", self);
-            [self finalShutdown];
-        }
-    }
+    // TODO: Once the factory knows it's dealing with MTRDeviceController_Concrete, this can be removed, and its
+    // declaration moved to MTRDeviceController_Concrete.
+    return NO;
 }
 
 - (void)clearPendingShutdown
 {
-    std::lock_guard lock(_assertionLock);
-    _shutdownPending = NO;
+    // TODO: Once the factory knows it's dealing with MTRDeviceController_Concrete, this can be removed, and its
+    // declaration moved to MTRDeviceController_Concrete.
+    MTR_ABSTRACT_METHOD();
 }
 
 - (void)shutdown
 {
-    std::lock_guard lock(_assertionLock);
-
-    if (_keepRunningAssertionCounter > 0) {
-        MTR_LOG("%@ Pending shutdown since %lu assertions are present", self, static_cast<unsigned long>(_keepRunningAssertionCounter));
-        _shutdownPending = YES;
-        return;
-    }
-    [self finalShutdown];
-}
-
-- (void)finalShutdown
-{
-    os_unfair_lock_assert_owner(&_assertionLock);
-
-    MTR_LOG("%@ shutdown called", self);
-    if (_cppCommissioner == nullptr) {
-        // Already shut down.
-        return;
-    }
-
-    MTR_LOG("Shutting down %@: %@", NSStringFromClass(self.class), self);
-    [self cleanupAfterStartup];
+    MTR_ABSTRACT_METHOD();
 }
 
 // Clean up from a state where startup was called.
@@ -604,7 +549,6 @@ using namespace chip::Tracing::DarwinFramework;
             _operationalCredentialsDelegate->SetDeviceCommissioner(nullptr);
         }
     }
-    _shutdownPending = NO;
 }
 
 - (void)deinitFromFactory
